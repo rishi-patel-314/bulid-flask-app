@@ -1,19 +1,16 @@
 import configparser
-import json
 import os
+import json
 import logging
 from flask import Flask, jsonify, Response
 from flask.json.provider import DefaultJSONProvider
+from flask.cli import with_appcontext
 from pydantic import BaseModel, ValidationError
 import numpy as np
 import pandas as pd
 from gevent.pywsgi import WSGIServer
 
-# Read configurations from .ini file
-config = configparser.ConfigParser()
-config.read(os.path.join(os.path.dirname(__file__), "configs/app_config.ini"))
-ENV = os.environ.get("FLASK_ENV", "dev")  # Default to 'dev' if FLASK_ENV is not set
-
+# 1. Configuration Management (SRP)
 class AppConfig(BaseModel):
     ENV: str
     DEBUG: bool
@@ -21,74 +18,77 @@ class AppConfig(BaseModel):
     PORT: int
     LOGGING_LEVEL: str
 
-    class Config:
-        populate_by_name = True
-
     @staticmethod
     def from_env():
-        """Load configurations from environment and fallback to .ini"""
+        config = configparser.ConfigParser()
+        config.read(os.path.join(os.path.dirname(__file__), "configs/app_config.ini"))
+        env = os.environ.get("FLASK_ENV", "dev")
         return AppConfig(
-            ENV=os.getenv("ENV", config.get(ENV, "env", fallback="dev")),
-            DEBUG=os.getenv("DEBUG", config.getboolean(ENV, "debug", fallback="false")),
-            HOST=os.getenv("HOST", config.get(ENV, "host", fallback="127.0.0.1")),
-            PORT=os.getenv("PORT", config.getint(ENV, "port", fallback=5000)),
+            ENV=os.getenv("ENV", config.get(env, "env", fallback="dev")),
+            DEBUG=os.getenv("DEBUG", config.getboolean(env, "debug", fallback="false")),
+            HOST=os.getenv("HOST", config.get(env, "host", fallback="127.0.0.1")),
+            PORT=os.getenv("PORT", config.getint(env, "port", fallback=5000)),
             LOGGING_LEVEL=os.getenv(
-                "LOGGING_LEVEL", config.get(ENV, "logging_level", fallback="INFO")
+                "LOGGING_LEVEL", config.get(env, "logging_level", fallback="INFO")
             ),
         )
 
+# 2. Logging Setup (SRP)
 def setup_logging(level: str):
-    """Set up logging for the application."""
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logging.info("Logging is set up with level: %s", level)
 
-def create_app():
-    """Application factory function."""
-    app = Flask(__name__)
+# 3. Custom JSON Provider (SRP, OCP)
+class CustomJSONProvider(DefaultJSONProvider):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        elif isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        elif isinstance(obj, pd.DataFrame):
+            return obj.to_dict(orient="records")
+        return super().default(obj)
 
-    # Load configuration
+# 4. Flask Application Factory (SRP, DIP)
+def create_app():
+    app = Flask(__name__)
+    app.json = CustomJSONProvider(app)
+
+    # Load and validate configuration
     try:
         app_config = AppConfig.from_env()
-        app.config.update(app_config.model_dump())
+        app.config.update(app_config.dict())
         setup_logging(app.config["LOGGING_LEVEL"])
     except ValidationError as e:
         logging.error("Configuration validation failed: %s", e)
         raise
 
-    # Define a custom JSONEncoder to handle Numpy and Pandas objects
+    # Define Routes
+    register_routes(app)
 
-    class CustomJSONProvider(DefaultJSONProvider):
-        def default(self, obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()  # Convert NumPy array to list
-            elif isinstance(obj, (np.integer, np.floating)):
-                return obj.item()  # Convert NumPy scalar to native Python scalar
-            elif isinstance(obj, pd.Timestamp):
-                return obj.isoformat()  # Convert Pandas Timestamp to ISO string
-            elif isinstance(obj, pd.DataFrame):
-                return obj.to_dict(orient="records")  # Convert DataFrame to dict
-            return super().default(obj)  # Call parent class's default method
+    # Register custom CLI commands
+    register_cli_commands(app)
 
-    app.json = CustomJSONProvider(app)  # Set the custom JSON provider
+    return app
 
+# 5. Route Management (SRP, OCP)
+def register_routes(app: Flask):
     @app.route("/")
     def home():
         return jsonify({"message": "Welcome to the app", "env": app.config["ENV"]})
 
     @app.route("/data")
     def get_data():
-        array = np.array([1, 2, 3])
-        number = np.float64(42.42)
-        timestamp = pd.Timestamp("2023-12-18 10:00:00")
-        dataframe = pd.DataFrame({"A": [1, 2], "B": [3, 4]})
         response_data = {
-            "array": array,
-            "number": number,
-            "timestamp": timestamp,
-            "dataframe": dataframe,
+            "array": np.array([1, 2, 3]),
+            "number": np.float64(42.42),
+            "timestamp": pd.Timestamp("2023-12-18 10:00:00"),
+            "dataframe": pd.DataFrame({"A": [1, 2], "B": [3, 4]}),
         }
         return jsonify(response_data)
 
@@ -96,9 +96,9 @@ def create_app():
     def reload_config():
         try:
             app_config = AppConfig.from_env()
-            app.config.update(app_config.model_dump())
+            app.config.update(app_config.dict())
             setup_logging(app.config["LOGGING_LEVEL"])
-            return jsonify({"message": "Configuration reloaded successfully", "config": app.config}), 200
+            return jsonify({"message": "Configuration reloaded successfully"}), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -106,22 +106,22 @@ def create_app():
     def health():
         return jsonify({"status": "healthy"}), 200
 
-    return app
+# 6. CLI Command Registration (SRP)
+def register_cli_commands(app: Flask):
+    @app.cli.command("runserver")
+    @with_appcontext
+    def runserver():
+        """Run the application with WSGIServer."""
+        host = app.config["HOST"]
+        port = app.config["PORT"]
+        if app.config["ENV"] == "dev":
+            app.run(host=host, port=port, debug=app.config["DEBUG"])
+        else:
+            http_server = WSGIServer((host, port), app)
+            logging.info(f"Listening at: {host}:{port}")
+            http_server.serve_forever()
 
-app = create_app()
-
-# Custom CLI command to run the server
-@app.cli.command("runserver")
-def runserver():
-    """Run the application with WSGIServer."""
-    host = app.config["HOST"]
-    port = app.config["PORT"]
-    if app.config["ENV"] == "development":
-        app.run(host=host, port=port, debug=app.config["DEBUG"])
-    else:
-        http_server = WSGIServer((host, port), app)
-        logging.info(f"Listening at: {host}:{port}")
-        http_server.serve_forever()
-
+# Main Entry Point
 if __name__ == "__main__":
+    app = create_app()
     app.run()
